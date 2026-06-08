@@ -1,20 +1,24 @@
-"""ROB-4017: SupabaseDal must hand postgrest a thread-safe HTTP/1.1 client.
+"""ROB-4017: SupabaseDal must hand postgrest a thread-safe HTTP/1.1 client that
+also retries transient ``RemoteProtocolError``s.
 
-`postgrest.SyncPostgrestClient` builds its own ``httpx.Client(http2=True)`` when
-no client is supplied, and httpcore's *sync* HTTP/2 connection is not
+``postgrest.SyncPostgrestClient`` builds its own ``httpx.Client(http2=True)``
+when no client is supplied, and httpcore's *sync* HTTP/2 connection is not
 thread-safe. The conversation worker, realtime callbacks and request threads all
 share one ``SupabaseDal`` client, so under concurrency the HTTP/2 framing
 corrupts and calls fail with ``RemoteProtocolError: Server disconnected``
-(intermittent ``HolmesStatus`` upserts, dropped conversation claims). The DAL
-therefore constructs an explicit ``http2=False`` client and passes it via
+(intermittent ``HolmesStatus`` upserts, dropped conversation claims). On top of
+that, Supabase's edge closes idle keep-alive connections, so even HTTP/1.1 hits
+``RemoteProtocolError`` on a reused, server-closed connection.
+
+The DAL therefore builds the client on an explicit ``SupabaseRetryTransport``
+(``http2=False`` + ``RemoteProtocolError`` retry) and passes that client via
 ``ClientOptions(httpx_client=...)`` so postgrest does NOT build its own HTTP/2
-one.
+one. Because a custom transport is supplied, ``http2``/``verify`` live on the
+transport while ``timeout``/``follow_redirects`` stay on the client.
 
 These tests are deterministic (no network) and pin that wiring so it can't
-silently regress. The behavioural proof — a 32-thread x 60-req x 3-round stress
-against a live Supabase endpoint sharing one client, where ``http2=True``
-produced ~41% ``RemoteProtocolError`` and ``http2=False`` produced zero — is
-documented in the PR; it isn't run here because it needs network + credentials.
+silently regress. The retry behaviour itself is covered in
+``test_supabase_dal_retry.py``.
 """
 
 import base64
@@ -39,8 +43,9 @@ def _ui_token() -> str:
 
 def _build_dal(monkeypatch, ca_env=None):
     """Construct a SupabaseDal with network mocked, capturing the kwargs passed
-    to ``httpx.Client``, the ``ssl.create_default_context`` call (if any), and
-    the ``ClientOptions`` handed to ``create_client``."""
+    to ``SupabaseRetryTransport`` and ``httpx.Client``, the
+    ``ssl.create_default_context`` call (if any), and the ``ClientOptions``
+    handed to ``create_client``."""
     monkeypatch.setenv("ROBUSTA_UI_TOKEN", _ui_token())
     # Start from a clean CA-env slate; the test harness/sandbox may set these.
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
@@ -50,6 +55,11 @@ def _build_dal(monkeypatch, ca_env=None):
 
     captured: dict = {}
     ssl_ctx_sentinel = MagicMock(name="ssl_context")
+    transport_sentinel = MagicMock(name="transport")
+
+    def fake_transport(*args, **kwargs):
+        captured["transport_kwargs"] = kwargs
+        return transport_sentinel
 
     def fake_httpx_client(*args, **kwargs):
         captured["httpx_kwargs"] = kwargs
@@ -62,6 +72,10 @@ def _build_dal(monkeypatch, ca_env=None):
         return ssl_ctx_sentinel
 
     with (
+        patch(
+            "holmes.core.supabase_dal.SupabaseRetryTransport",
+            side_effect=fake_transport,
+        ),
         patch(
             "holmes.core.supabase_dal.httpx.Client", side_effect=fake_httpx_client
         ),
@@ -77,32 +91,37 @@ def _build_dal(monkeypatch, ca_env=None):
         # create_client(self.url, self.api_key, options) -> options is args[2]
         captured["options"] = mock_create.call_args.args[2]
     captured["ssl_ctx_sentinel"] = ssl_ctx_sentinel
+    captured["transport_sentinel"] = transport_sentinel
     return dal, captured
 
 
-def test_dal_disables_http2(monkeypatch):
+def test_dal_disables_http2_on_the_transport(monkeypatch):
     dal, cap = _build_dal(monkeypatch)
     assert dal.enabled is True
-    kw = cap["httpx_kwargs"]
-    assert kw["http2"] is False
-    assert kw["follow_redirects"] is True
-    assert kw["timeout"] == SUPABASE_TIMEOUT_SECONDS
+    # http2 is disabled on the transport (httpx ignores http2 on the client when
+    # a custom transport is supplied).
+    assert cap["transport_kwargs"]["http2"] is False
+    # timeout + redirect handling stay on the client.
+    assert cap["httpx_kwargs"]["follow_redirects"] is True
+    assert cap["httpx_kwargs"]["timeout"] == SUPABASE_TIMEOUT_SECONDS
 
 
-def test_dal_passes_our_client_to_postgrest(monkeypatch):
-    # The same explicit client must be handed to postgrest via ClientOptions, so
-    # postgrest reuses it instead of building its own http2=True client. Compare
-    # against the instance fake_httpx_client actually created (not a value read
-    # back from options, which would be a tautology).
+def test_dal_client_uses_our_transport_and_forwards_client_to_postgrest(monkeypatch):
+    # The client must be built on our SupabaseRetryTransport, and that exact
+    # client must be handed to postgrest via ClientOptions so postgrest reuses it
+    # instead of building its own http2=True client. Compare against the
+    # instances the fakes actually created (not values read back from options,
+    # which would be tautological).
     _, cap = _build_dal(monkeypatch)
+    assert cap["httpx_kwargs"]["transport"] is cap["transport_sentinel"]
     assert cap["created_client"] is not None
     assert cap["options"].httpx_client is cap["created_client"]
 
 
 def test_dal_verify_defaults_to_true_without_ca_env(monkeypatch):
     _, cap = _build_dal(monkeypatch)
-    # No CA env -> verify=True and no SSLContext is built.
-    assert cap["httpx_kwargs"]["verify"] is True
+    # No CA env -> verify=True on the transport and no SSLContext is built.
+    assert cap["transport_kwargs"]["verify"] is True
     assert "ssl_ctx_kwargs" not in cap
 
 
@@ -110,8 +129,8 @@ def test_dal_builds_sslcontext_not_string_for_verify(monkeypatch):
     # Forward-compatible with httpx: verify must be an SSLContext, never a path
     # string (httpx deprecated `verify=<str>`).
     _, cap = _build_dal(monkeypatch, ca_env={"SSL_CERT_FILE": "/etc/ssl/custom-ca.pem"})
-    assert cap["httpx_kwargs"]["verify"] is cap["ssl_ctx_sentinel"]
-    assert not isinstance(cap["httpx_kwargs"]["verify"], str)
+    assert cap["transport_kwargs"]["verify"] is cap["ssl_ctx_sentinel"]
+    assert not isinstance(cap["transport_kwargs"]["verify"], str)
 
 
 def test_dal_honors_ssl_cert_file_as_cafile(monkeypatch):
@@ -148,4 +167,4 @@ def test_dal_uses_capath_when_bundle_is_a_directory(monkeypatch, tmp_path):
 def test_dal_always_disables_http2_regardless_of_ca(monkeypatch, ca_env):
     # http2 must stay disabled no matter the CA configuration.
     _, cap = _build_dal(monkeypatch, ca_env=ca_env)
-    assert cap["httpx_kwargs"]["http2"] is False
+    assert cap["transport_kwargs"]["http2"] is False

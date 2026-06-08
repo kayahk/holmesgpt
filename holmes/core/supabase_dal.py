@@ -133,6 +133,56 @@ class SupabaseDnsException(Exception):
         super().__init__(message)
 
 
+class SupabaseRetryTransport(httpx.HTTPTransport):
+    """HTTP/1.1 transport that retries transient ``RemoteProtocolError``s.
+
+    Two problems are fixed at this transport, so every Supabase sub-client
+    (postgrest, auth/gotrue, storage, realtime) is hardened uniformly rather
+    than just postgrest table queries:
+
+    1. ``http2=False`` — httpcore's *sync* HTTP/2 connection is not thread-safe,
+       and one ``SupabaseDal`` client is shared across the conversation worker,
+       realtime callbacks and request threads. HTTP/1.1 gives each concurrent
+       request its own pooled, thread-safe connection.
+    2. Retry on ``RemoteProtocolError`` — even on HTTP/1.1, Supabase's edge
+       (Cloudflare / Kong / load balancer) closes idle keep-alive connections
+       server-side. A pooled connection the edge has already closed gets reused
+       and the next request fails with ``RemoteProtocolError: Server
+       disconnected without sending a response`` *before* it reaches Supabase.
+       The request was never processed, so retrying it on a fresh connection is
+       safe (postgrest/auth/storage bodies are buffered bytes, hence replayable).
+
+    This is the hardening Supabase support recommended (mirrors relay#573 /
+    ROB-4012; see ROB-4017).
+    """
+
+    def __init__(self, *args, disconnect_retries: int = 3, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.disconnect_retries = max(1, disconnect_retries)
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        last_exc: Optional[httpx.RemoteProtocolError] = None
+        for attempt in range(1, self.disconnect_retries + 1):
+            try:
+                return super().handle_request(request)
+            except httpx.RemoteProtocolError as exc:
+                # "Server disconnected" on a reused, edge-closed keep-alive
+                # connection: the request never reached Supabase, so retry it on
+                # a fresh connection.
+                last_exc = exc
+                logging.warning(
+                    "Supabase request %s %s hit RemoteProtocolError (%s); "
+                    "retrying on a fresh connection (attempt %d/%d)",
+                    request.method,
+                    request.url,
+                    exc,
+                    attempt,
+                    self.disconnect_retries,
+                )
+        assert last_exc is not None  # the loop body runs at least once
+        raise last_exc
+
+
 class SupabaseDal:
     def __init__(self, cluster: str):
         self.enabled = self.__init_config()
@@ -145,29 +195,26 @@ class SupabaseDal:
         logging.info(
             f"Initializing Robusta platform connection for account {self.account_id}"
         )
-        # Use an explicit HTTP/1.1 httpx client. By default postgrest builds a
-        # single multiplexed HTTP/2 connection, and httpcore's sync HTTP/2
-        # connection is NOT thread-safe — the conversation worker, realtime
-        # callbacks and request threads share this one client, so under
-        # concurrency the framing corrupts and calls fail with
-        # `RemoteProtocolError: Server disconnected` (intermittent HolmesStatus
-        # upserts, dropped conversation claims, etc.). HTTP/1.1 gives each
-        # concurrent request its own pooled, thread-safe connection. The timeout
-        # is set on the client itself because supabase ignores
-        # `postgrest_client_timeout` once an `httpx_client` is provided.
-        # Mirrors the relay-side fix (ROB-4012); see ROB-4017.
+        # Hand postgrest/auth/storage/realtime one explicit httpx client built on
+        # SupabaseRetryTransport (HTTP/1.1 + RemoteProtocolError retry). By
+        # default postgrest builds its own HTTP/2 client; the custom transport
+        # both disables HTTP/2 (httpcore's sync HTTP/2 connection is not
+        # thread-safe and this client is shared across threads) and retries the
+        # transient "Server disconnected" errors that Supabase's edge causes by
+        # closing idle keep-alive connections. See SupabaseRetryTransport and
+        # ROB-4017 (mirrors relay#573 / ROB-4012).
+        #
         # Honor the environment's CA bundle (e.g. a corporate / TLS-proxy CA in
         # SSL_CERT_FILE / REQUESTS_CA_BUNDLE) the way supabase's default client
-        # does — supplying our own httpx client otherwise falls back to certifi
-        # and breaks TLS verification behind an intercepting proxy.
+        # does — supplying our own client otherwise falls back to certifi and
+        # breaks TLS verification behind an intercepting proxy. Pass an explicit
+        # SSLContext rather than the bundle path as a string: httpx has
+        # deprecated `verify=<str>`. create_default_context trusts exactly the
+        # provided bundle, honoring both a CA file (SSL_CERT_FILE convention) and
+        # a CA directory.
         ca_bundle = os.environ.get("SSL_CERT_FILE") or os.environ.get(
             "REQUESTS_CA_BUNDLE"
         )
-        # Pass an explicit SSLContext rather than the bundle path as a string:
-        # httpx has deprecated `verify=<str>` (to be removed in a future
-        # release). create_default_context trusts exactly the provided bundle —
-        # matching the previous string behaviour — and we honor both a CA file
-        # (SSL_CERT_FILE convention) and a CA directory.
         verify: "ssl.SSLContext | bool"
         if not ca_bundle:
             verify = True
@@ -175,11 +222,16 @@ class SupabaseDal:
             verify = ssl.create_default_context(capath=ca_bundle)
         else:
             verify = ssl.create_default_context(cafile=ca_bundle)
+        # `verify`/`http2` belong on the transport (httpx ignores them on the
+        # client once a custom transport is supplied); `timeout` and
+        # `follow_redirects` stay on the client. The timeout is set on the client
+        # because supabase ignores `postgrest_client_timeout` once an
+        # `httpx_client` is provided.
+        transport = SupabaseRetryTransport(http2=False, verify=verify)
         httpx_client = httpx.Client(
-            http2=False,
+            transport=transport,
             timeout=SUPABASE_TIMEOUT_SECONDS,
             follow_redirects=True,
-            verify=verify,
         )
         options = ClientOptions(
             postgrest_client_timeout=SUPABASE_TIMEOUT_SECONDS,
@@ -196,31 +248,10 @@ class SupabaseDal:
     def patch_postgrest_execute(self):
         logging.info("Patching postgres execute")
 
-        # Retry transient transport errors before doing anything else. Supabase's
-        # edge (Cloudflare / Kong / load balancer) closes idle keep-alive
-        # connections server-side. The DAL client is shared across the
-        # conversation worker, realtime callbacks and request threads, so a
-        # pooled connection the edge has already closed gets reused and the next
-        # query fails with
-        # `RemoteProtocolError: Server disconnected without sending a response`.
-        # The request never reached Supabase, so retrying it on a fresh
-        # connection is safe — this is the hardening Supabase support recommended
-        # for these errors (ROB-4017; mirrors relay#573 / ROB-4012). Disabling
-        # HTTP/2 reduces but does not eliminate them, so the retry is still
-        # required on top of the HTTP/1.1 client.
-        @retry(
-            retry=retry_if_exception_type(httpx.RemoteProtocolError),
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=0.5, min=0.5, max=2.0),
-            reraise=True,
-        )
-        def execute_with_transport_retry(_self):
-            return self._original_execute(_self)
-
         # This is somewhat hacky.
         def execute_with_retry(_self):
             try:
-                return execute_with_transport_retry(_self)
+                return self._original_execute(_self)
             except PGAPIError as exc:
                 message = exc.message or ""
                 if exc.code == "PGRST301" or "expired" in message.lower():
@@ -231,7 +262,7 @@ class SupabaseDal:
                     self.sign_in()
                     # update the session to the new one, after re-sign in
                     _self.session = self.client.postgrest.session
-                    return execute_with_transport_retry(_self)
+                    return self._original_execute(_self)
                 else:
                     raise
 
