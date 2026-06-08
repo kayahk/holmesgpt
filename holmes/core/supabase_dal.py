@@ -196,10 +196,31 @@ class SupabaseDal:
     def patch_postgrest_execute(self):
         logging.info("Patching postgres execute")
 
+        # Retry transient transport errors before doing anything else. Supabase's
+        # edge (Cloudflare / Kong / load balancer) closes idle keep-alive
+        # connections server-side. The DAL client is shared across the
+        # conversation worker, realtime callbacks and request threads, so a
+        # pooled connection the edge has already closed gets reused and the next
+        # query fails with
+        # `RemoteProtocolError: Server disconnected without sending a response`.
+        # The request never reached Supabase, so retrying it on a fresh
+        # connection is safe — this is the hardening Supabase support recommended
+        # for these errors (ROB-4017; mirrors relay#573 / ROB-4012). Disabling
+        # HTTP/2 reduces but does not eliminate them, so the retry is still
+        # required on top of the HTTP/1.1 client.
+        @retry(
+            retry=retry_if_exception_type(httpx.RemoteProtocolError),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=0.5, min=0.5, max=2.0),
+            reraise=True,
+        )
+        def execute_with_transport_retry(_self):
+            return self._original_execute(_self)
+
         # This is somewhat hacky.
         def execute_with_retry(_self):
             try:
-                return self._original_execute(_self)
+                return execute_with_transport_retry(_self)
             except PGAPIError as exc:
                 message = exc.message or ""
                 if exc.code == "PGRST301" or "expired" in message.lower():
@@ -210,7 +231,7 @@ class SupabaseDal:
                     self.sign_in()
                     # update the session to the new one, after re-sign in
                     _self.session = self.client.postgrest.session
-                    return self._original_execute(_self)
+                    return execute_with_transport_retry(_self)
                 else:
                     raise
 
