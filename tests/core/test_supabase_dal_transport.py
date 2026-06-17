@@ -1,23 +1,12 @@
-"""ROB-4017: SupabaseDal must hand postgrest a thread-safe HTTP/1.1 client that
-also retries transient ``RemoteProtocolError``s.
+"""ROB-4017: pin the wiring that hands postgrest a thread-safe HTTP/1.1 client.
 
-``postgrest.SyncPostgrestClient`` builds its own ``httpx.Client(http2=True)``
-when no client is supplied, and httpcore's *sync* HTTP/2 connection is not
-thread-safe. The conversation worker, realtime callbacks and request threads all
-share one ``SupabaseDal`` client, so under concurrency the HTTP/2 framing
-corrupts and calls fail with ``RemoteProtocolError: Server disconnected``
-(intermittent ``HolmesStatus`` upserts, dropped conversation claims). On top of
-that, Supabase's edge closes idle keep-alive connections, so even HTTP/1.1 hits
-``RemoteProtocolError`` on a reused, server-closed connection.
+SupabaseDal must build its httpx client on ``SupabaseRetryTransport`` and pass it
+to postgrest via ``ClientOptions(httpx_client=...)`` so postgrest doesn't build
+its own HTTP/2 client (see ``SupabaseRetryTransport`` for why). Because a custom
+transport is supplied, ``http2``/``verify`` live on the transport while
+``timeout``/``follow_redirects`` stay on the client.
 
-The DAL therefore builds the client on an explicit ``SupabaseRetryTransport``
-(``http2=False`` + ``RemoteProtocolError`` retry) and passes that client via
-``ClientOptions(httpx_client=...)`` so postgrest does NOT build its own HTTP/2
-one. Because a custom transport is supplied, ``http2``/``verify`` live on the
-transport while ``timeout``/``follow_redirects`` stay on the client.
-
-These tests are deterministic (no network) and pin that wiring so it can't
-silently regress. The retry behaviour itself is covered in
+Deterministic (no network); retry behaviour is covered in
 ``test_supabase_dal_retry.py``.
 """
 

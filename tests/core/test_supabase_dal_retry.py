@@ -1,20 +1,10 @@
-"""ROB-4017 follow-up: SupabaseDal's httpx transport must retry transient
-``RemoteProtocolError``s ("Server disconnected").
+"""ROB-4017: pin ``SupabaseRetryTransport``'s retry contract.
 
-Supabase's edge (Cloudflare / Kong / load balancer) closes idle keep-alive
-connections server-side. One ``SupabaseDal`` client is shared across the
-conversation worker, realtime callbacks and request threads, so a pooled
-connection the edge already closed gets reused and the next request raises
-``RemoteProtocolError: Server disconnected without sending a response`` *before*
-the request reaches Supabase — which makes it safe to retry on a fresh
-connection. Hardening at the transport (rather than around postgrest's
-``execute``) means every Supabase sub-client — postgrest, auth/gotrue, storage,
-realtime — is covered uniformly. This is the hardening Supabase support
-recommended (mirrors relay#573 / ROB-4012).
-
-These tests are deterministic (no network): they drive
-``SupabaseRetryTransport.handle_request`` directly with the base transport's
-``handle_request`` patched to raise/return on demand.
+Deterministically drive ``SupabaseRetryTransport.handle_request`` (with the base
+transport's ``handle_request`` patched to raise/return on demand) to verify it
+retries ``RemoteProtocolError`` on a fresh connection, stops after
+``disconnect_retries``, reraises the original exception, and does not retry other
+errors. See ``SupabaseRetryTransport`` for why this retry is needed and safe.
 """
 
 from unittest.mock import MagicMock

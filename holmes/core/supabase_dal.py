@@ -170,11 +170,9 @@ class SupabaseRetryTransport(httpx.HTTPTransport):
         self.disconnect_retries = max(1, disconnect_retries)
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        # Retry only RemoteProtocolError, with no backoff: "Server disconnected"
-        # on a reused, edge-closed keep-alive connection means the request never
-        # reached Supabase, so the fix is to reissue it on a fresh connection
-        # immediately (httpcore drops the dead one). The Retrying() iterator form
-        # is used rather than the @retry decorator so the attempt budget can come
+        # No backoff: a reaped keep-alive socket just needs a fresh connection
+        # (see the class docstring for why retrying is safe). The Retrying()
+        # iterator form (not the @retry decorator) lets the attempt budget come
         # from the per-instance disconnect_retries.
         def _log_retry(retry_state: RetryCallState) -> None:
             exc = retry_state.outcome.exception() if retry_state.outcome else None
@@ -213,23 +211,15 @@ class SupabaseDal:
         logging.info(
             f"Initializing Robusta platform connection for account {self.account_id}"
         )
-        # Hand postgrest/auth/storage/realtime one explicit httpx client built on
-        # SupabaseRetryTransport (HTTP/1.1 + RemoteProtocolError retry). By
-        # default postgrest builds its own HTTP/2 client; the custom transport
-        # both disables HTTP/2 (httpcore's sync HTTP/2 connection is not
-        # thread-safe and this client is shared across threads) and retries the
-        # transient "Server disconnected" errors that Supabase's edge causes by
-        # closing idle keep-alive connections. See SupabaseRetryTransport and
-        # ROB-4017 (mirrors relay#573 / ROB-4012).
+        # Build the client on SupabaseRetryTransport (HTTP/1.1 + RemoteProtocolError
+        # retry — see its docstring) and hand it to postgrest so postgrest doesn't
+        # build its own HTTP/2 client.
         #
-        # Honor the environment's CA bundle (e.g. a corporate / TLS-proxy CA in
-        # SSL_CERT_FILE / REQUESTS_CA_BUNDLE) the way supabase's default client
-        # does — supplying our own client otherwise falls back to certifi and
-        # breaks TLS verification behind an intercepting proxy. Pass an explicit
-        # SSLContext rather than the bundle path as a string: httpx has
-        # deprecated `verify=<str>`. create_default_context trusts exactly the
-        # provided bundle, honoring both a CA file (SSL_CERT_FILE convention) and
-        # a CA directory.
+        # Honor the environment's CA bundle (corporate / TLS-proxy CA in
+        # SSL_CERT_FILE / REQUESTS_CA_BUNDLE) the way supabase's default client does;
+        # our own client otherwise falls back to certifi and breaks TLS verification
+        # behind an intercepting proxy. Pass an SSLContext, not the path string
+        # (httpx deprecated `verify=<str>`), honoring a CA file or directory.
         ca_bundle = os.environ.get("SSL_CERT_FILE") or os.environ.get(
             "REQUESTS_CA_BUNDLE"
         )
@@ -240,11 +230,9 @@ class SupabaseDal:
             verify = ssl.create_default_context(capath=ca_bundle)
         else:
             verify = ssl.create_default_context(cafile=ca_bundle)
-        # `verify`/`http2` belong on the transport (httpx ignores them on the
-        # client once a custom transport is supplied); `timeout` and
-        # `follow_redirects` stay on the client. The timeout is set on the client
-        # because supabase ignores `postgrest_client_timeout` once an
-        # `httpx_client` is provided.
+        # verify/http2 go on the transport (httpx ignores them on the client once a
+        # custom transport is supplied); timeout/follow_redirects stay on the client
+        # (supabase ignores postgrest_client_timeout once an httpx_client is given).
         transport = SupabaseRetryTransport(http2=False, verify=verify)
         httpx_client = httpx.Client(
             transport=transport,
