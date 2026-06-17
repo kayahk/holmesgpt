@@ -24,6 +24,8 @@ from pydantic import BaseModel
 from supabase import create_client
 from supabase.lib.client_options import SyncClientOptions as ClientOptions
 from tenacity import (
+    RetryCallState,
+    Retrying,
     retry,
     retry_if_exception_type,
     retry_if_not_exception_type,
@@ -168,26 +170,35 @@ class SupabaseRetryTransport(httpx.HTTPTransport):
         self.disconnect_retries = max(1, disconnect_retries)
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        last_exc: Optional[httpx.RemoteProtocolError] = None
-        for attempt in range(1, self.disconnect_retries + 1):
-            try:
+        # Retry only RemoteProtocolError, with no backoff: "Server disconnected"
+        # on a reused, edge-closed keep-alive connection means the request never
+        # reached Supabase, so the fix is to reissue it on a fresh connection
+        # immediately (httpcore drops the dead one). The Retrying() iterator form
+        # is used rather than the @retry decorator so the attempt budget can come
+        # from the per-instance disconnect_retries.
+        def _log_retry(retry_state: RetryCallState) -> None:
+            exc = retry_state.outcome.exception() if retry_state.outcome else None
+            logging.warning(
+                "Supabase request %s %s hit RemoteProtocolError (%s); "
+                "retrying on a fresh connection (attempt %d/%d)",
+                request.method,
+                request.url,
+                exc,
+                retry_state.attempt_number,
+                self.disconnect_retries,
+            )
+
+        for attempt in Retrying(
+            retry=retry_if_exception_type(httpx.RemoteProtocolError),
+            stop=stop_after_attempt(self.disconnect_retries),
+            before_sleep=_log_retry,
+            reraise=True,
+        ):
+            with attempt:
                 return super().handle_request(request)
-            except httpx.RemoteProtocolError as exc:
-                # "Server disconnected" on a reused, edge-closed keep-alive
-                # connection: the request never reached Supabase, so retry it on
-                # a fresh connection.
-                last_exc = exc
-                logging.warning(
-                    "Supabase request %s %s hit RemoteProtocolError (%s); "
-                    "retrying on a fresh connection (attempt %d/%d)",
-                    request.method,
-                    request.url,
-                    exc,
-                    attempt,
-                    self.disconnect_retries,
-                )
-        assert last_exc is not None  # the loop body runs at least once
-        raise last_exc
+        raise AssertionError(  # unreachable: Retrying returns a response or re-raises
+            "SupabaseRetryTransport retry loop exited without returning"
+        )
 
 
 class SupabaseDal:
